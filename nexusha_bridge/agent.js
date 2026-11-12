@@ -98,10 +98,113 @@ function supervisorPost(urlPath, payload) {
   });
 }
 
-function automationReply(ws, reqId, ok, error) {
+function automationReply(ws, reqId, ok, error, category) {
   const message = { type: "save_ha_automation_result", reqId, ok: Boolean(ok) };
   if (!ok) message.error = String(error || "Kayıt başarısız.");
+  else if (category) message.category = category;
   try { ws.send(JSON.stringify(message)); } catch (e) {}
+}
+
+function haCommandSocket() {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket("ws://supervisor/core/websocket");
+    const pending = new Map();
+    let nextId = 1;
+    let settled = false;
+    const timer = setTimeout(() => fail(new Error("Home Assistant soketi zaman aşımına uğradı.")), 8000);
+    function fail(error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.close(); } catch (e) {}
+      reject(error);
+    }
+    function send(type, fields) {
+      const id = nextId++;
+      return new Promise((res, rej) => {
+        const commandTimer = setTimeout(() => {
+          pending.delete(id);
+          rej(new Error("Home Assistant komutu zaman aşımına uğradı."));
+        }, 8000);
+        pending.set(id, {
+          res: (value) => { clearTimeout(commandTimer); res(value); },
+          rej: (error) => { clearTimeout(commandTimer); rej(error); }
+        });
+        socket.send(JSON.stringify(Object.assign({ id, type }, fields || {})));
+      });
+    }
+    socket.on("message", (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+      if (msg.type === "auth_required") {
+        socket.send(JSON.stringify({ type: "auth", access_token: TOKEN }));
+        return;
+      }
+      if (msg.type === "auth_invalid") return fail(new Error(msg.message || "auth_invalid"));
+      if (msg.type === "auth_ok") {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          send,
+          close: () => { try { socket.close(); } catch (e) {} }
+        });
+        return;
+      }
+      if (msg.type === "result" && pending.has(msg.id)) {
+        const waiter = pending.get(msg.id);
+        pending.delete(msg.id);
+        if (msg.success) waiter.res(msg.result);
+        else waiter.rej(new Error((msg.error && msg.error.message) || "Komut reddedildi."));
+      }
+    });
+    socket.on("error", (err) => fail(err));
+    socket.on("close", () => {
+      for (const waiter of pending.values()) waiter.rej(new Error("Soket kapandı."));
+      pending.clear();
+    });
+  });
+}
+
+function sameText(value, expected) {
+  return String(value || "").trim().toLowerCase() === String(expected || "").trim().toLowerCase();
+}
+
+async function findSavedEntity(link, kind, id, config) {
+  const direct = kind + "." + id;
+  const alias = String((config && (config.alias || config.name)) || "").trim();
+  let states = [];
+  try { states = await link.send("get_states"); } catch (e) { return direct; }
+  const list = (Array.isArray(states) ? states : []).filter((item) => String(item.entity_id || "").startsWith(kind + "."));
+  const byObject = list.find((item) => item.entity_id === direct);
+  if (byObject) return byObject.entity_id;
+  const byConfig = list.find((item) => String(item.attributes && item.attributes.id || "") === id);
+  if (byConfig) return byConfig.entity_id;
+  if (alias) {
+    const byName = list.find((item) => sameText(item.attributes && (item.attributes.friendly_name || item.attributes.alias), alias));
+    if (byName) return byName.entity_id;
+  }
+  return direct;
+}
+
+async function assignNexusCategory(kind, id, config) {
+  const link = await haCommandSocket();
+  try {
+    const listed = await link.send("config/category_registry/list", { scope: kind });
+    const existing = (Array.isArray(listed) ? listed : []).find((item) => sameText(item && item.name, "NexusHA AI"));
+    let categoryId = existing && existing.category_id;
+    if (!categoryId) {
+      const created = await link.send("config/category_registry/create", { scope: kind, name: "NexusHA AI", icon: "mdi:creation" });
+      categoryId = created && created.category_id;
+    }
+    if (!categoryId) throw new Error("Kategori kimliği alınamadı.");
+    const entityId = await findSavedEntity(link, kind, id, config);
+    const categories = {};
+    categories[kind] = categoryId;
+    await link.send("config/entity_registry/update", { entity_id: entityId, categories });
+  } finally {
+    link.close();
+  }
 }
 
 async function saveHaAutomation(message) {
@@ -120,6 +223,12 @@ async function saveHaAutomation(message) {
     const detail = reloaded.body.replace(/\s+/g, " ").trim().slice(0, 180);
     throw new Error(detail || "Kaydedildi ama yeniden yüklenemedi.");
   }
+  try {
+    await assignNexusCategory(kind, id, message.config);
+  } catch (error) {
+    console.error("[NexusHA] Kategori atanamadi:", error.message);
+  }
+  return "NexusHA AI";
 }
 
 function connect() {
@@ -157,7 +266,7 @@ function connect() {
 
       if (r.type === "save_ha_automation") {
         saveHaAutomation(r)
-          .then(() => automationReply(ws, r.reqId, true))
+          .then((category) => automationReply(ws, r.reqId, true, "", category))
           .catch((err) => automationReply(ws, r.reqId, false, err.message));
         return;
       }
