@@ -1,10 +1,17 @@
-FROM alpine:3.20
+ARG BUILD_FROM
+FROM $BUILD_FROM
 
+# Node.js ve npm kurulumu
 RUN apk add --no-cache nodejs npm
 
 WORKDIR /app
+
+# Bağımlılıkları kur
 RUN npm init -y && npm install ws
 
+# Uygulama ve başlatma betiğini kopyala
 COPY agent.js /app/agent.js
+COPY run.sh /app/run.sh
+RUN chmod a+x /app/run.sh
 
-CMD ["node", "/app/agent.js"]
+CMD [ "/app/run.sh" ]
