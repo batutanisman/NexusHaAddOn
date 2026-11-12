@@ -232,9 +232,15 @@ async function saveHaAutomation(message) {
 }
 
 let tunnel = null;
+const STATE_DOMAINS = new Set([
+  "light", "switch", "climate", "cover", "lock", "fan", "media_player",
+  "vacuum", "binary_sensor", "person", "alarm_control_panel", "automation", "scene"
+]);
 
 function sendHaState(newState) {
   if (!newState || typeof newState !== "object" || !newState.entity_id) return;
+  const domain = String(newState.entity_id).split(".")[0];
+  if (!STATE_DOMAINS.has(domain)) return;
   if (!tunnel || tunnel.readyState !== WebSocket.OPEN) return;
   try {
     tunnel.send(JSON.stringify({ type: "ha_state_changed", state: newState }));
@@ -297,10 +303,17 @@ function connect() {
 
   const ws = new WebSocket(url);
   tunnel = ws;
+  let keepAlive = null;
 
   ws.on("open", () => {
     state.status = "connected";
     if (creds) console.log("[NexusHA] Tunel aktif:", creds.agentId);
+    if (keepAlive) clearInterval(keepAlive);
+    keepAlive = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try { ws.ping(); } catch (e) {}
+      try { ws.send(JSON.stringify({ type: "ping" })); } catch (e) {}
+    }, 20000);
   });
 
   ws.on("ping", () => ws.pong());
@@ -364,6 +377,7 @@ function connect() {
   });
 
   ws.on("close", () => {
+    if (keepAlive) clearInterval(keepAlive);
     if (tunnel === ws) tunnel = null;
     setTimeout(connect, 5000);
   });
