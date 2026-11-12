@@ -74,6 +74,54 @@ http.createServer((req, res) => {
   res.end(renderHtml());
 }).listen(8099, "0.0.0.0");
 
+function supervisorPost(urlPath, payload) {
+  const data = JSON.stringify(payload == null ? {} : payload);
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: "supervisor",
+      port: 80,
+      path: urlPath,
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data)
+      }
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => resolve({ status: res.statusCode || 500, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.on("error", reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+function automationReply(ws, reqId, ok, error) {
+  const message = { type: "save_ha_automation_result", reqId, ok: Boolean(ok) };
+  if (!ok) message.error = String(error || "Kayıt başarısız.");
+  try { ws.send(JSON.stringify(message)); } catch (e) {}
+}
+
+async function saveHaAutomation(message) {
+  const kind = message.kind === "scene" ? "scene" : message.kind === "automation" ? "automation" : "";
+  const id = String(message.id || "").replace(/[^a-zA-Z0-9_]/g, "").slice(0, 80);
+  if (!kind || !id || !message.config || typeof message.config !== "object" || Array.isArray(message.config)) {
+    throw new Error("Eksik otomasyon verisi.");
+  }
+  const saved = await supervisorPost(`/core/api/config/${kind}/config/${encodeURIComponent(id)}`, message.config);
+  if (saved.status < 200 || saved.status >= 300) {
+    const detail = saved.body.replace(/\s+/g, " ").trim().slice(0, 180);
+    throw new Error(detail || "Home Assistant kaydı reddetti.");
+  }
+  const reloaded = await supervisorPost(`/core/api/services/${kind}/reload`, {});
+  if (reloaded.status < 200 || reloaded.status >= 300) {
+    const detail = reloaded.body.replace(/\s+/g, " ").trim().slice(0, 180);
+    throw new Error(detail || "Kaydedildi ama yeniden yüklenemedi.");
+  }
+}
+
 function connect() {
   const creds = getCreds();
   const url = creds
@@ -107,6 +155,14 @@ function connect() {
         return console.log("[NexusHA] Eslesme basarili:", r.agentId);
       }
 
+      if (r.type === "save_ha_automation") {
+        saveHaAutomation(r)
+          .then(() => automationReply(ws, r.reqId, true))
+          .catch((err) => automationReply(ws, r.reqId, false, err.message));
+        return;
+      }
+
+      if (!r.path) return;
       const targetPath = r.path.startsWith("/api") ? `/core${r.path}` : `/core/api${r.path}`;
       const haReq = http.request({
         hostname: "supervisor",
