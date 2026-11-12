@@ -231,6 +231,62 @@ async function saveHaAutomation(message) {
   return "NexusHA AI";
 }
 
+let tunnel = null;
+
+function sendHaState(newState) {
+  if (!newState || typeof newState !== "object" || !newState.entity_id) return;
+  if (!tunnel || tunnel.readyState !== WebSocket.OPEN) return;
+  try {
+    tunnel.send(JSON.stringify({ type: "ha_state_changed", state: newState }));
+  } catch (e) {}
+}
+
+function listenHaStates() {
+  const socket = new WebSocket("ws://supervisor/core/websocket");
+  let closed = false;
+  let pingTimer = null;
+  const reconnect = () => {
+    if (closed) return;
+    closed = true;
+    if (pingTimer) clearInterval(pingTimer);
+    try { socket.close(); } catch (e) {}
+    setTimeout(listenHaStates, 5000);
+  };
+  socket.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+    if (msg.type === "auth_required") {
+      socket.send(JSON.stringify({ type: "auth", access_token: TOKEN }));
+      return;
+    }
+    if (msg.type === "auth_invalid") {
+      console.error("[NexusHA] HA olay auth:", msg.message || "auth_invalid");
+      reconnect();
+      return;
+    }
+    if (msg.type === "auth_ok") {
+      socket.send(JSON.stringify({ id: 1, type: "subscribe_events", event_type: "state_changed" }));
+      pingTimer = setInterval(() => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        try { socket.send(JSON.stringify({ id: Date.now(), type: "ping" })); } catch (e) {}
+      }, 30000);
+      console.log("[NexusHA] state_changed dinleniyor");
+      return;
+    }
+    if (msg.type === "event" && msg.event && msg.event.event_type === "state_changed") {
+      sendHaState(msg.event.data && msg.event.data.new_state);
+    }
+  });
+  socket.on("close", () => {
+    console.error("[NexusHA] HA olay soketi kapandi, 5 sn sonra yeniden baglanacak");
+    reconnect();
+  });
+  socket.on("error", (err) => {
+    console.error("[NexusHA] HA olay soketi:", err.message);
+    reconnect();
+  });
+}
+
 function connect() {
   const creds = getCreds();
   const url = creds
@@ -240,6 +296,7 @@ function connect() {
   if (creds) state.agentId = creds.agentId;
 
   const ws = new WebSocket(url);
+  tunnel = ws;
 
   ws.on("open", () => {
     state.status = "connected";
@@ -306,8 +363,12 @@ function connect() {
     }
   });
 
-  ws.on("close", () => setTimeout(connect, 5000));
+  ws.on("close", () => {
+    if (tunnel === ws) tunnel = null;
+    setTimeout(connect, 5000);
+  });
   ws.on("error", (err) => console.error("[NexusHA] WS Hatasi:", err.message));
 }
 
 connect();
+listenHaStates();
