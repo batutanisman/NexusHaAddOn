@@ -5,7 +5,20 @@ const fs = require("fs");
 const TOKEN = process.env.SUPERVISOR_TOKEN;
 const PAIR_FILE = "/data/pairing.json";
 const OPTIONS_FILE = "/data/options.json";
-const ADDON_VERSION = "1.2.7";
+
+function readAddonVersion() {
+  const files = ["/app/config.yaml", __dirname + "/config.yaml", "./config.yaml"];
+  for (const file of files) {
+    try {
+      const text = fs.readFileSync(file, "utf8");
+      const match = text.match(/^version:\s*["']?([^"'\n#]+)/m);
+      if (match && match[1]) return String(match[1]).trim();
+    } catch (e) {}
+  }
+  return "1.2.8";
+}
+
+const ADDON_VERSION = readAddonVersion();
 
 let cloudBaseUrl = "wss://nexusha.app/tunnel";
 try {
@@ -13,7 +26,7 @@ try {
   if (opts.cloud_url) cloudBaseUrl = opts.cloud_url;
 } catch (e) {}
 
-let state = { status: "connecting", code: null, agentId: null, version: ADDON_VERSION };
+let state = { status: "connecting", code: null, agentId: null, version: ADDON_VERSION, addonVersion: ADDON_VERSION };
 
 function getCreds() {
   try {
@@ -117,28 +130,38 @@ http.createServer((req, res) => {
   res.end(renderHtml());
 }).listen(8099, "0.0.0.0");
 
-function supervisorPost(urlPath, payload) {
-  const data = JSON.stringify(payload == null ? {} : payload);
+function supervisorRequest(method, urlPath, payload) {
+  const hasBody = payload !== undefined;
+  const data = hasBody ? JSON.stringify(payload == null ? {} : payload) : "";
   return new Promise((resolve, reject) => {
+    const headers = { Authorization: `Bearer ${TOKEN}` };
+    if (hasBody) {
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = Buffer.byteLength(data);
+    }
     const req = http.request({
       hostname: "supervisor",
       port: 80,
       path: urlPath,
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${TOKEN}`,
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(data)
-      }
+      method: method || "GET",
+      headers
     }, (res) => {
       const chunks = [];
       res.on("data", (d) => chunks.push(d));
       res.on("end", () => resolve({ status: res.statusCode || 500, body: Buffer.concat(chunks).toString("utf8") }));
     });
     req.on("error", reject);
-    req.write(data);
+    if (hasBody) req.write(data);
     req.end();
   });
+}
+
+function supervisorPost(urlPath, payload) {
+  return supervisorRequest("POST", urlPath, payload == null ? {} : payload);
+}
+
+function supervisorGet(urlPath) {
+  return supervisorRequest("GET", urlPath);
 }
 
 function automationReply(ws, reqId, ok, error, category) {
@@ -203,25 +226,42 @@ async function runScene(message) {
   return { ok: true, executedCount };
 }
 
-function reportVersion(ws) {
+function versionPayload(type) {
+  return {
+    type: type || "addon_version",
+    addonVersion: ADDON_VERSION,
+    version: ADDON_VERSION,
+    agentId: state.agentId || null
+  };
+}
+
+function reportVersion(ws, type) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send(JSON.stringify(versionPayload(type || "addon_version"))); } catch (e) {}
+}
+
+function sendHello(ws) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const creds = getCreds();
   try {
     ws.send(JSON.stringify({
-      type: "addon_version",
+      type: creds ? "register" : "hello",
+      addonVersion: ADDON_VERSION,
       version: ADDON_VERSION,
-      agentId: state.agentId || null
+      agentId: (creds && creds.agentId) || state.agentId || null
     }));
   } catch (e) {}
 }
 
-function updateAddonReply(ws, reqId, ok, error, action) {
+function updateAddonReply(ws, reqId, ok, error, extra) {
   const message = {
     type: "update_addon_result",
     reqId,
     ok: Boolean(ok),
+    addonVersion: ADDON_VERSION,
     version: ADDON_VERSION
   };
-  if (action) message.action = action;
+  if (extra && typeof extra === "object") Object.assign(message, extra);
   if (!ok) message.error = String(error || "Güncelleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
   try { ws.send(JSON.stringify(message)); } catch (e) {}
 }
@@ -230,21 +270,34 @@ function supervisorOk(result) {
   return result && result.status >= 200 && result.status < 300;
 }
 
+function parseSupervisorJson(result) {
+  try { return JSON.parse((result && result.body) || "{}"); } catch (e) { return {}; }
+}
+
 async function updateAddon() {
+  if (!TOKEN) throw new Error("SUPERVISOR_TOKEN yok.");
   const reloaded = await supervisorPost("/store/reload", {});
   if (!supervisorOk(reloaded)) {
     const detail = String(reloaded && reloaded.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
     throw new Error(detail || "Store yenilenemedi.");
   }
-  const updated = await supervisorPost("/addons/self/update", {});
-  if (supervisorOk(updated)) return { ok: true, action: "update" };
-  const rebuilt = await supervisorPost("/addons/self/rebuild", {});
-  if (supervisorOk(rebuilt)) return { ok: true, action: "rebuild" };
-  const detail = String((updated && updated.body) || (rebuilt && rebuilt.body) || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 160);
-  throw new Error(detail || "Eklenti güncellemesi görünmüyor ve rebuild başarısız.");
+  const info = await supervisorGet("/addons/self/info");
+  if (!supervisorOk(info)) {
+    const detail = String(info && info.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
+    throw new Error(detail || "Eklenti bilgisi alınamadı.");
+  }
+  const payload = parseSupervisorJson(info);
+  const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
+  const updateAvailable = data && data.update_available === true;
+  const action = updateAvailable ? "update" : "rebuild";
+  const triggered = updateAvailable
+    ? await supervisorPost("/addons/self/update", {})
+    : await supervisorPost("/addons/self/rebuild", {});
+  if (!supervisorOk(triggered)) {
+    const detail = String(triggered && triggered.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
+    throw new Error(detail || (updateAvailable ? "Güncelleme başlatılamadı." : "Rebuild başlatılamadı."));
+  }
+  return { ok: true, status: "updating", action };
 }
 
 function haCommandSocket() {
@@ -451,12 +504,20 @@ function connect() {
     state.status = "connected";
     if (creds) console.log("[NexusHA] Tunel aktif:", creds.agentId, "v" + ADDON_VERSION);
     else console.log("[NexusHA] Tunel baglandi, surum:", ADDON_VERSION);
-    reportVersion(ws);
+    sendHello(ws);
+    reportVersion(ws, "addon_version");
     if (keepAlive) clearInterval(keepAlive);
     keepAlive = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return;
       try { ws.ping(); } catch (e) {}
-      try { ws.send(JSON.stringify({ type: "ping", version: ADDON_VERSION })); } catch (e) {}
+      try {
+        ws.send(JSON.stringify({
+          type: "heartbeat",
+          addonVersion: ADDON_VERSION,
+          version: ADDON_VERSION,
+          agentId: state.agentId || null
+        }));
+      } catch (e) {}
     }, 20000);
   });
 
@@ -475,7 +536,8 @@ function connect() {
         fs.writeFileSync(PAIR_FILE, JSON.stringify({ agentId: r.agentId, secret: r.secret }));
         state.agentId = r.agentId;
         state.code = null;
-        reportVersion(ws);
+        sendHello(ws);
+        reportVersion(ws, "register");
         return console.log("[NexusHA] Eslesme basarili:", r.agentId, "v" + ADDON_VERSION);
       }
 
@@ -495,7 +557,10 @@ function connect() {
 
       if (r.type === "update_addon") {
         updateAddon()
-          .then((result) => updateAddonReply(ws, r.reqId, true, "", result.action))
+          .then((result) => updateAddonReply(ws, r.reqId, true, "", {
+            status: result.status || "updating",
+            action: result.action || ""
+          }))
           .catch((err) => updateAddonReply(ws, r.reqId, false, err.message));
         return;
       }

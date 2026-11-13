@@ -11,6 +11,7 @@ RUN npm init -y && npm install ws
 
 # Uygulama ve başlatma betiğini kopyala
 COPY agent.js /app/agent.js
+COPY config.yaml /app/config.yaml
 COPY run.sh /app/run.sh
 RUN chmod a+x /app/run.sh
 
