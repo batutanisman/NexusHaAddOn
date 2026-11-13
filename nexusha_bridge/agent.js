@@ -15,7 +15,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.3.7";
+  return "1.3.9";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -311,66 +311,86 @@ function reportUpdateProgress(ws, step, percent, message) {
   } catch (e) {}
 }
 
-async function supervisorApiCall(link, endpoint, method, data) {
-  return link.send("supervisor/api", {
-    endpoint: String(endpoint || ""),
-    method: String(method || "get").toLowerCase(),
-    data: data && typeof data === "object" ? data : {}
-  }, { timeout: 30000 });
+function pickNexusUpdateEntity(states) {
+  const list = Array.isArray(states) ? states : [];
+  const matches = list.filter((item) => {
+    const id = String(item && item.entity_id || "").toLowerCase();
+    return id.startsWith("update.") && id.includes("nexusha");
+  });
+  if (!matches.length) return null;
+  const ready = matches.find((item) => String(item.state || "").toLowerCase() === "on");
+  return ready || matches[0];
+}
+
+async function fetchHaStates() {
+  try {
+    const link = await haCommandSocket({ connectTimeout: 12000, commandTimeout: 15000 });
+    try {
+      const states = await link.send("get_states");
+      return Array.isArray(states) ? states : [];
+    } finally {
+      try { link.close(); } catch (e) {}
+    }
+  } catch (wsError) {
+    const result = await supervisorGet("/core/api/states");
+    if (!supervisorOk(result)) {
+      throw new Error(supervisorErrorText(result, wsError && wsError.message || "Durumlar alınamadı."));
+    }
+    const parsed = parseSupervisorJson(result);
+    return Array.isArray(parsed) ? parsed : [];
+  }
 }
 
 async function updateAddon(ws) {
   if (!TOKEN) throw new Error("SUPERVISOR_TOKEN yok.");
-  let link = null;
   try {
     reportUpdateProgress(ws, "reload", 20, "GitHub mağaza önbelleği yenileniyor...");
     const reloaded = await supervisorPost("/store/reload", {});
     if (!supervisorOk(reloaded)) {
       throw new Error(supervisorErrorText(reloaded, "Store yenilenemedi."));
     }
-    await sleep(3000);
+    await sleep(3500);
 
-    const info = await supervisorGet("/addons/self/info");
-    if (!supervisorOk(info)) {
-      throw new Error(supervisorErrorText(info, "Eklenti bilgisi alınamadı."));
-    }
-    const payload = parseSupervisorJson(info);
-    const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
-    const slug = String(data && data.slug || "").trim();
-    if (!slug) throw new Error("Eklenti slug değeri okunamadı.");
-    const updateAvailable = data && data.update_available === true;
-    const updateEndpoint = `/addons/${slug}/update`;
-    const rebuildEndpoint = `/addons/${slug}/rebuild`;
+    reportUpdateProgress(ws, "install", 50, "Güncelleme varlığı aranıyor...");
+    let updateEntityId = "";
+    let lastError = null;
 
-    reportUpdateProgress(ws, "update", 50, "Home Assistant güncelleme isteği gönderiliyor...");
-    link = await haCommandSocket({ connectTimeout: 12000, commandTimeout: 30000 });
-
-    let action = "update";
-    if (updateAvailable) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        await supervisorApiCall(link, updateEndpoint, "post", { backup: false });
-      } catch (updateError) {
-        console.log("[NexusHA] WS update başarısız, rebuild deneniyor:", updateError && updateError.message);
-        action = "rebuild";
-        reportUpdateProgress(ws, "rebuild", 50, "Güncelleme yok/hata — yeniden derleme başlatılıyor...");
-        await supervisorApiCall(link, rebuildEndpoint, "post", {});
+        const states = await fetchHaStates();
+        const entity = pickNexusUpdateEntity(states);
+        if (!entity || !entity.entity_id) {
+          throw new Error("NexusHA güncelleme varlığı bulunamadı.");
+        }
+        updateEntityId = String(entity.entity_id);
+        if (String(entity.state || "").toLowerCase() !== "on") {
+          throw new Error("Güncelleme henüz hazır değil (update entity off).");
+        }
+
+        reportUpdateProgress(ws, "install", 50, "Home Assistant update.install tetikleniyor...");
+        const installed = await supervisorPost("/core/api/services/update/install", {
+          entity_id: updateEntityId
+        });
+        if (!supervisorOk(installed)) {
+          throw new Error(supervisorErrorText(installed, "update.install reddedildi."));
+        }
+
+        reportUpdateProgress(ws, "restart", 80, "Eklenti yeniden başlatılıyor...");
+        console.log("[NexusHA] update.install tetiklendi:", updateEntityId);
+        await sleep(1000);
+        return { ok: true, status: "updating", action: "update_install", entity_id: updateEntityId };
+      } catch (attemptError) {
+        lastError = attemptError;
+        console.log("[NexusHA] update.install denemesi", attempt, attemptError && attemptError.message);
+        if (attempt < 3) await sleep(2000);
       }
-    } else {
-      action = "rebuild";
-      reportUpdateProgress(ws, "rebuild", 50, "Mağaza sürümü hazır değil — yeniden derleme başlatılıyor...");
-      await supervisorApiCall(link, rebuildEndpoint, "post", {});
     }
 
-    reportUpdateProgress(ws, "restart", 80, "Eklenti yeniden başlatılıyor...");
-    console.log("[NexusHA] supervisor/api", action, slug);
-    await sleep(1000);
-    return { ok: true, status: "updating", action, slug };
+    throw lastError || new Error("Güncelleme başlatılamadı.");
   } catch (error) {
     const message = String(error && error.message || error || "Güncelleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
     reportUpdateProgress(ws, "error", 0, message);
     throw new Error(message);
-  } finally {
-    if (link) try { link.close(); } catch (e) {}
   }
 }
 
