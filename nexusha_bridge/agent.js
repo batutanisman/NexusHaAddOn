@@ -15,7 +15,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.3.5";
+  return "1.3.7";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -311,17 +311,25 @@ function reportUpdateProgress(ws, step, percent, message) {
   } catch (e) {}
 }
 
+async function supervisorApiCall(link, endpoint, method, data) {
+  return link.send("supervisor/api", {
+    endpoint: String(endpoint || ""),
+    method: String(method || "get").toLowerCase(),
+    data: data && typeof data === "object" ? data : {}
+  }, { timeout: 30000 });
+}
+
 async function updateAddon(ws) {
   if (!TOKEN) throw new Error("SUPERVISOR_TOKEN yok.");
+  let link = null;
   try {
     reportUpdateProgress(ws, "reload", 20, "GitHub mağaza önbelleği yenileniyor...");
     const reloaded = await supervisorPost("/store/reload", {});
     if (!supervisorOk(reloaded)) {
       throw new Error(supervisorErrorText(reloaded, "Store yenilenemedi."));
     }
-    await sleep(2500);
+    await sleep(3000);
 
-    reportUpdateProgress(ws, "service", 45, "Home Assistant güncelleme servisi tetikleniyor...");
     const info = await supervisorGet("/addons/self/info");
     if (!supervisorOk(info)) {
       throw new Error(supervisorErrorText(info, "Eklenti bilgisi alınamadı."));
@@ -330,30 +338,51 @@ async function updateAddon(ws) {
     const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
     const slug = String(data && data.slug || "").trim();
     if (!slug) throw new Error("Eklenti slug değeri okunamadı.");
+    const updateAvailable = data && data.update_available === true;
+    const updateEndpoint = `/addons/${slug}/update`;
+    const rebuildEndpoint = `/addons/${slug}/rebuild`;
 
-    // Core hassio.addon_update — eklenti kendini kapatırken bile arka planda tamamlanır.
-    const triggered = await supervisorPost("/core/api/services/hassio/addon_update", { addon: slug });
-    if (!supervisorOk(triggered)) {
-      throw new Error(supervisorErrorText(triggered, "Güncelleme servisi başlatılamadı."));
+    reportUpdateProgress(ws, "update", 50, "Home Assistant güncelleme isteği gönderiliyor...");
+    link = await haCommandSocket({ connectTimeout: 12000, commandTimeout: 30000 });
+
+    let action = "update";
+    if (updateAvailable) {
+      try {
+        await supervisorApiCall(link, updateEndpoint, "post", { backup: false });
+      } catch (updateError) {
+        console.log("[NexusHA] WS update başarısız, rebuild deneniyor:", updateError && updateError.message);
+        action = "rebuild";
+        reportUpdateProgress(ws, "rebuild", 50, "Güncelleme yok/hata — yeniden derleme başlatılıyor...");
+        await supervisorApiCall(link, rebuildEndpoint, "post", {});
+      }
+    } else {
+      action = "rebuild";
+      reportUpdateProgress(ws, "rebuild", 50, "Mağaza sürümü hazır değil — yeniden derleme başlatılıyor...");
+      await supervisorApiCall(link, rebuildEndpoint, "post", {});
     }
 
-    console.log("[NexusHA] hassio.addon_update tetiklendi:", slug);
+    reportUpdateProgress(ws, "restart", 80, "Eklenti yeniden başlatılıyor...");
+    console.log("[NexusHA] supervisor/api", action, slug);
     await sleep(1000);
-    return { ok: true, status: "updating", action: "addon_update", slug };
+    return { ok: true, status: "updating", action, slug };
   } catch (error) {
     const message = String(error && error.message || error || "Güncelleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
     reportUpdateProgress(ws, "error", 0, message);
     throw new Error(message);
+  } finally {
+    if (link) try { link.close(); } catch (e) {}
   }
 }
 
-function haCommandSocket() {
+function haCommandSocket(options) {
+  const connectTimeout = Number(options && options.connectTimeout) || 8000;
+  const defaultCommandTimeout = Number(options && options.commandTimeout) || 8000;
   return new Promise((resolve, reject) => {
     const socket = new WebSocket("ws://supervisor/core/websocket");
     const pending = new Map();
     let nextId = 1;
     let settled = false;
-    const timer = setTimeout(() => fail(new Error("Home Assistant soketi zaman aşımına uğradı.")), 8000);
+    const timer = setTimeout(() => fail(new Error("Home Assistant soketi zaman aşımına uğradı.")), connectTimeout);
     function fail(error) {
       if (settled) return;
       settled = true;
@@ -361,13 +390,14 @@ function haCommandSocket() {
       try { socket.close(); } catch (e) {}
       reject(error);
     }
-    function send(type, fields) {
+    function send(type, fields, sendOptions) {
       const id = nextId++;
+      const commandTimeout = Number(sendOptions && sendOptions.timeout) || defaultCommandTimeout;
       return new Promise((res, rej) => {
         const commandTimer = setTimeout(() => {
           pending.delete(id);
           rej(new Error("Home Assistant komutu zaman aşımına uğradı."));
-        }, 8000);
+        }, commandTimeout);
         pending.set(id, {
           res: (value) => { clearTimeout(commandTimer); res(value); },
           rej: (error) => { clearTimeout(commandTimer); rej(error); }
