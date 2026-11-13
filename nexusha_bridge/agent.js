@@ -15,7 +15,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.2.8";
+  return "1.3.1";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -274,22 +274,63 @@ function parseSupervisorJson(result) {
   try { return JSON.parse((result && result.body) || "{}"); } catch (e) { return {}; }
 }
 
-async function updateAddon() {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function reportUpdateProgress(ws, step, percent, message) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(JSON.stringify({
+      type: "addon_update_progress",
+      step: String(step || ""),
+      percent: Number(percent) || 0,
+      message: String(message || "").replace(/\s+/g, " ").trim().slice(0, 180),
+      addonVersion: ADDON_VERSION,
+      version: ADDON_VERSION,
+      agentId: state.agentId || null
+    }));
+  } catch (e) {}
+}
+
+async function updateAddon(ws) {
   if (!TOKEN) throw new Error("SUPERVISOR_TOKEN yok.");
   try {
+    reportUpdateProgress(ws, "reload", 15, "GitHub mağaza önbelleği yenileniyor...");
     const reloaded = await supervisorPost("/store/reload", {});
     if (!supervisorOk(reloaded)) {
       const detail = String(reloaded && reloaded.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
       throw new Error(detail || "Store yenilenemedi.");
     }
-    const triggered = await supervisorPost("/addons/self/update", {});
+    await sleep(2500);
+
+    reportUpdateProgress(ws, "verify", 35, "Yeni sürüm doğrulanıyor...");
+    const info = await supervisorGet("/addons/self/info");
+    if (!supervisorOk(info)) {
+      const detail = String(info && info.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
+      throw new Error(detail || "Eklenti bilgisi alınamadı.");
+    }
+    const payload = parseSupervisorJson(info);
+    const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
+    const updateAvailable = data && data.update_available === true;
+    const action = updateAvailable ? "update" : "rebuild";
+
+    reportUpdateProgress(ws, "rebuild", 60, "Eklenti yeniden derleniyor ve başlatılıyor...");
+    const triggered = updateAvailable
+      ? await supervisorPost("/addons/self/update", { backup: false })
+      : await supervisorPost("/addons/self/rebuild", {});
     if (!supervisorOk(triggered)) {
       const detail = String(triggered && triggered.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
-      throw new Error(detail || "Güncelleme başlatılamadı.");
+      throw new Error(detail || (updateAvailable ? "Güncelleme başlatılamadı." : "Rebuild başlatılamadı."));
     }
-    return { ok: true, status: "updating", action: "update" };
+
+    // Supervisor eklentiyi yeniden başlatana kadar bekler; süreç kapanır.
+    await sleep(1500);
+    return { ok: true, status: "updating", action };
   } catch (error) {
-    throw new Error(String(error && error.message || error || "Güncelleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180));
+    const message = String(error && error.message || error || "Güncelleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
+    reportUpdateProgress(ws, "error", 0, message);
+    throw new Error(message);
   }
 }
 
@@ -549,7 +590,7 @@ function connect() {
       }
 
       if (r.type === "update_addon") {
-        updateAddon()
+        updateAddon(ws)
           .then((result) => updateAddonReply(ws, r.reqId, true, "", {
             status: result.status || "updating",
             action: result.action || ""
