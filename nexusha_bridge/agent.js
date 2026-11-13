@@ -15,7 +15,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.3.3";
+  return "1.3.5";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -314,14 +314,14 @@ function reportUpdateProgress(ws, step, percent, message) {
 async function updateAddon(ws) {
   if (!TOKEN) throw new Error("SUPERVISOR_TOKEN yok.");
   try {
-    reportUpdateProgress(ws, "reload", 15, "GitHub mağaza önbelleği yenileniyor...");
+    reportUpdateProgress(ws, "reload", 20, "GitHub mağaza önbelleği yenileniyor...");
     const reloaded = await supervisorPost("/store/reload", {});
     if (!supervisorOk(reloaded)) {
       throw new Error(supervisorErrorText(reloaded, "Store yenilenemedi."));
     }
     await sleep(2500);
 
-    reportUpdateProgress(ws, "verify", 35, "Yeni sürüm doğrulanıyor...");
+    reportUpdateProgress(ws, "service", 45, "Home Assistant güncelleme servisi tetikleniyor...");
     const info = await supervisorGet("/addons/self/info");
     if (!supervisorOk(info)) {
       throw new Error(supervisorErrorText(info, "Eklenti bilgisi alınamadı."));
@@ -330,29 +330,16 @@ async function updateAddon(ws) {
     const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
     const slug = String(data && data.slug || "").trim();
     if (!slug) throw new Error("Eklenti slug değeri okunamadı.");
-    const slugPath = encodeURIComponent(slug);
-    const updateAvailable = data && data.update_available === true;
-    let action = updateAvailable ? "update" : "rebuild";
 
-    reportUpdateProgress(ws, "rebuild", 60, "Eklenti yeniden derleniyor ve başlatılıyor...");
-    let triggered;
-    if (updateAvailable) {
-      triggered = await supervisorPost(`/addons/${slugPath}/update`, { backup: false });
-      if (!supervisorOk(triggered) && isStoreAppMissingError(triggered)) {
-        console.log("[NexusHA] Store update başarısız, rebuild'e düşülüyor:", slug);
-        action = "rebuild";
-        triggered = await supervisorPost(`/addons/${slugPath}/rebuild`, {});
-      }
-    } else {
-      triggered = await supervisorPost(`/addons/${slugPath}/rebuild`, {});
-    }
+    // Core hassio.addon_update — eklenti kendini kapatırken bile arka planda tamamlanır.
+    const triggered = await supervisorPost("/core/api/services/hassio/addon_update", { addon: slug });
     if (!supervisorOk(triggered)) {
-      throw new Error(supervisorErrorText(triggered, action === "update" ? "Güncelleme başlatılamadı." : "Rebuild başlatılamadı."));
+      throw new Error(supervisorErrorText(triggered, "Güncelleme servisi başlatılamadı."));
     }
 
-    // Supervisor eklentiyi yeniden başlatana kadar bekler; süreç kapanır.
-    await sleep(1500);
-    return { ok: true, status: "updating", action, slug };
+    console.log("[NexusHA] hassio.addon_update tetiklendi:", slug);
+    await sleep(1000);
+    return { ok: true, status: "updating", action: "addon_update", slug };
   } catch (error) {
     const message = String(error && error.message || error || "Güncelleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
     reportUpdateProgress(ws, "error", 0, message);
