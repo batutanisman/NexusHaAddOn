@@ -34,9 +34,12 @@ const renderHtml = () => `<!DOCTYPE html>
     .badge { display: inline-block; padding: .35rem .85rem; border-radius: 999px; font-size: .85rem; font-weight: 600; margin-bottom: 1.2rem; }
     .ok { background: #065f46; color: #34d399; }
     .wait { background: #78350f; color: #fbbf24; }
-    .code { font-size: 2.4rem; font-weight: 800; letter-spacing: .15em; background: #0f172a; padding: 1rem; border-radius: .75rem; margin: 1rem 0; border: 1px dashed #38bdf8; color: #38bdf8; user-select: all; }
+    .code { font-size: 2.4rem; font-weight: 800; letter-spacing: .15em; background: #0f172a; padding: 1rem; border-radius: .75rem; margin: 1rem 0 0.75rem; border: 1px dashed #38bdf8; color: #38bdf8; user-select: all; }
     button { background: #ef4444; color: #fff; border: none; padding: .75rem 1.25rem; border-radius: .5rem; font-weight: 600; cursor: pointer; margin-top: 1.5rem; width: 100%; }
     button:hover { background: #dc2626; }
+    .copy-btn { background: #0369a1; margin-top: 0.75rem; }
+    .copy-btn:hover { background: #0284c7; }
+    .copy-btn.done { background: #065f46; }
     p { color: #94a3b8; font-size: .95rem; line-height: 1.5; }
   </style>
 </head>
@@ -53,9 +56,48 @@ const renderHtml = () => `<!DOCTYPE html>
     ` : `
       <span class="badge wait">● Eşleşme Bekleniyor</span>
       <p><strong>nexusha.app</strong> paneline girip aşağıdaki 6 haneli kodu yazın:</p>
-      <div class="code">${state.code || "..."}</div>
+      <div class="code" id="pair-code">${state.code || "..."}</div>
+      <button type="button" class="copy-btn" id="copy-pair">Kopyala</button>
       <p>Kod girildiğinde ekran otomatik güncellenecektir.</p>
-      <script>setTimeout(() => location.reload(), 4000);<\/script>
+      <script>
+        (function () {
+          var btn = document.getElementById("copy-pair");
+          var code = document.getElementById("pair-code");
+          if (!btn || !code) return;
+          btn.addEventListener("click", function () {
+            var text = (code.textContent || "").trim();
+            if (!text || text === "...") return;
+            var done = function () {
+              btn.textContent = "Kopyalandı ✓";
+              btn.classList.add("done");
+              setTimeout(function () {
+                btn.textContent = "Kopyala";
+                btn.classList.remove("done");
+              }, 1600);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(done).catch(function () {
+                var area = document.createElement("textarea");
+                area.value = text;
+                document.body.appendChild(area);
+                area.select();
+                document.execCommand("copy");
+                area.remove();
+                done();
+              });
+            } else {
+              var area = document.createElement("textarea");
+              area.value = text;
+              document.body.appendChild(area);
+              area.select();
+              document.execCommand("copy");
+              area.remove();
+              done();
+            }
+          });
+        })();
+        setTimeout(function () { location.reload(); }, 4000);
+      <\/script>
     `}
   </div>
 </body>
@@ -103,6 +145,61 @@ function automationReply(ws, reqId, ok, error, category) {
   if (!ok) message.error = String(error || "Kayıt başarısız.");
   else if (category) message.category = category;
   try { ws.send(JSON.stringify(message)); } catch (e) {}
+}
+
+function sceneReply(ws, reqId, ok, error, executedCount) {
+  const message = {
+    type: "run_scene_result",
+    reqId,
+    ok: Boolean(ok),
+    executedCount: Number(executedCount) || 0
+  };
+  if (!ok) message.error = String(error || "Sahne çalıştırılamadı.").replace(/\s+/g, " ").trim().slice(0, 180);
+  try { ws.send(JSON.stringify(message)); } catch (e) {}
+}
+
+const SCENE_SERVICE_DOMAINS = new Set([
+  "light", "switch", "climate", "cover", "lock", "fan", "media_player",
+  "vacuum", "scene", "script", "input_boolean", "input_number", "input_select",
+  "humidifier", "water_heater", "remote", "button"
+]);
+
+function normalizeSceneAction(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+  const entityId = String(item.entity_id || item.entity || "").trim();
+  if (!/^[a-z][a-z0-9_]*\.[a-z0-9_]+$/.test(entityId)) return null;
+  const domain = String(item.domain || entityId.split(".")[0] || "").trim().toLowerCase();
+  const service = String(item.service || item.action || "").trim();
+  if (!domain || !service || !SCENE_SERVICE_DOMAINS.has(domain)) return null;
+  if (!/^[a-z][a-z0-9_]*$/.test(service)) return null;
+  const data = item.service_data && typeof item.service_data === "object" && !Array.isArray(item.service_data)
+    ? item.service_data
+    : item.data && typeof item.data === "object" && !Array.isArray(item.data)
+      ? item.data
+      : {};
+  const payload = Object.assign({}, data, { entity_id: entityId });
+  return { domain, service, payload };
+}
+
+async function runScene(message) {
+  const actions = Array.isArray(message && message.actions) ? message.actions : [];
+  if (!actions.length) throw new Error("Sahne aksiyonu yok.");
+  if (actions.length > 80) throw new Error("Sahne aksiyon limiti aşıldı.");
+  let executedCount = 0;
+  for (const raw of actions) {
+    const action = normalizeSceneAction(raw);
+    if (!action) throw new Error("Geçersiz sahne aksiyonu.");
+    const result = await supervisorPost(
+      `/core/api/services/${encodeURIComponent(action.domain)}/${encodeURIComponent(action.service)}`,
+      action.payload
+    );
+    if (result.status < 200 || result.status >= 300) {
+      const detail = String(result.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
+      throw new Error(detail || `${action.domain}.${action.service} reddedildi.`);
+    }
+    executedCount += 1;
+  }
+  return { ok: true, executedCount };
 }
 
 function haCommandSocket() {
@@ -338,6 +435,13 @@ function connect() {
         saveHaAutomation(r)
           .then((category) => automationReply(ws, r.reqId, true, "", category))
           .catch((err) => automationReply(ws, r.reqId, false, err.message));
+        return;
+      }
+
+      if (r.type === "run_scene" || r.type === "execute_scene") {
+        runScene(r)
+          .then((result) => sceneReply(ws, r.reqId, true, "", result.executedCount))
+          .catch((err) => sceneReply(ws, r.reqId, false, err.message, 0));
         return;
       }
 
