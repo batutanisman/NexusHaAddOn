@@ -15,7 +15,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.3.1";
+  return "1.3.3";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -274,6 +274,24 @@ function parseSupervisorJson(result) {
   try { return JSON.parse((result && result.body) || "{}"); } catch (e) { return {}; }
 }
 
+function supervisorErrorText(result, fallback) {
+  const body = String(result && result.body || "").replace(/\s+/g, " ").trim();
+  if (!body) return fallback || "Supervisor isteği başarısız.";
+  try {
+    const json = JSON.parse(body);
+    const message = json && (json.message || json.error || (json.data && json.data.message));
+    if (message) return String(message).replace(/\s+/g, " ").trim().slice(0, 160);
+  } catch (e) {}
+  return body.slice(0, 160);
+}
+
+function isStoreAppMissingError(result) {
+  const text = supervisorErrorText(result, "").toLowerCase();
+  return text.includes("store_app_not_found_error")
+    || text.includes("does not exist in the store")
+    || text.includes("app self does not exist");
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -299,34 +317,42 @@ async function updateAddon(ws) {
     reportUpdateProgress(ws, "reload", 15, "GitHub mağaza önbelleği yenileniyor...");
     const reloaded = await supervisorPost("/store/reload", {});
     if (!supervisorOk(reloaded)) {
-      const detail = String(reloaded && reloaded.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
-      throw new Error(detail || "Store yenilenemedi.");
+      throw new Error(supervisorErrorText(reloaded, "Store yenilenemedi."));
     }
     await sleep(2500);
 
     reportUpdateProgress(ws, "verify", 35, "Yeni sürüm doğrulanıyor...");
     const info = await supervisorGet("/addons/self/info");
     if (!supervisorOk(info)) {
-      const detail = String(info && info.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
-      throw new Error(detail || "Eklenti bilgisi alınamadı.");
+      throw new Error(supervisorErrorText(info, "Eklenti bilgisi alınamadı."));
     }
     const payload = parseSupervisorJson(info);
     const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
+    const slug = String(data && data.slug || "").trim();
+    if (!slug) throw new Error("Eklenti slug değeri okunamadı.");
+    const slugPath = encodeURIComponent(slug);
     const updateAvailable = data && data.update_available === true;
-    const action = updateAvailable ? "update" : "rebuild";
+    let action = updateAvailable ? "update" : "rebuild";
 
     reportUpdateProgress(ws, "rebuild", 60, "Eklenti yeniden derleniyor ve başlatılıyor...");
-    const triggered = updateAvailable
-      ? await supervisorPost("/addons/self/update", { backup: false })
-      : await supervisorPost("/addons/self/rebuild", {});
+    let triggered;
+    if (updateAvailable) {
+      triggered = await supervisorPost(`/addons/${slugPath}/update`, { backup: false });
+      if (!supervisorOk(triggered) && isStoreAppMissingError(triggered)) {
+        console.log("[NexusHA] Store update başarısız, rebuild'e düşülüyor:", slug);
+        action = "rebuild";
+        triggered = await supervisorPost(`/addons/${slugPath}/rebuild`, {});
+      }
+    } else {
+      triggered = await supervisorPost(`/addons/${slugPath}/rebuild`, {});
+    }
     if (!supervisorOk(triggered)) {
-      const detail = String(triggered && triggered.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
-      throw new Error(detail || (updateAvailable ? "Güncelleme başlatılamadı." : "Rebuild başlatılamadı."));
+      throw new Error(supervisorErrorText(triggered, action === "update" ? "Güncelleme başlatılamadı." : "Rebuild başlatılamadı."));
     }
 
     // Supervisor eklentiyi yeniden başlatana kadar bekler; süreç kapanır.
     await sleep(1500);
-    return { ok: true, status: "updating", action };
+    return { ok: true, status: "updating", action, slug };
   } catch (error) {
     const message = String(error && error.message || error || "Güncelleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
     reportUpdateProgress(ws, "error", 0, message);
