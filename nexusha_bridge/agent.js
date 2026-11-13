@@ -276,28 +276,21 @@ function parseSupervisorJson(result) {
 
 async function updateAddon() {
   if (!TOKEN) throw new Error("SUPERVISOR_TOKEN yok.");
-  const reloaded = await supervisorPost("/store/reload", {});
-  if (!supervisorOk(reloaded)) {
-    const detail = String(reloaded && reloaded.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
-    throw new Error(detail || "Store yenilenemedi.");
+  try {
+    const reloaded = await supervisorPost("/store/reload", {});
+    if (!supervisorOk(reloaded)) {
+      const detail = String(reloaded && reloaded.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
+      throw new Error(detail || "Store yenilenemedi.");
+    }
+    const triggered = await supervisorPost("/addons/self/update", {});
+    if (!supervisorOk(triggered)) {
+      const detail = String(triggered && triggered.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
+      throw new Error(detail || "Güncelleme başlatılamadı.");
+    }
+    return { ok: true, status: "updating", action: "update" };
+  } catch (error) {
+    throw new Error(String(error && error.message || error || "Güncelleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180));
   }
-  const info = await supervisorGet("/addons/self/info");
-  if (!supervisorOk(info)) {
-    const detail = String(info && info.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
-    throw new Error(detail || "Eklenti bilgisi alınamadı.");
-  }
-  const payload = parseSupervisorJson(info);
-  const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
-  const updateAvailable = data && data.update_available === true;
-  const action = updateAvailable ? "update" : "rebuild";
-  const triggered = updateAvailable
-    ? await supervisorPost("/addons/self/update", {})
-    : await supervisorPost("/addons/self/rebuild", {});
-  if (!supervisorOk(triggered)) {
-    const detail = String(triggered && triggered.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
-    throw new Error(detail || (updateAvailable ? "Güncelleme başlatılamadı." : "Rebuild başlatılamadı."));
-  }
-  return { ok: true, status: "updating", action };
 }
 
 function haCommandSocket() {
