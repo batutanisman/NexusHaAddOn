@@ -5,6 +5,7 @@ const fs = require("fs");
 const TOKEN = process.env.SUPERVISOR_TOKEN;
 const PAIR_FILE = "/data/pairing.json";
 const OPTIONS_FILE = "/data/options.json";
+const ADDON_VERSION = "1.2.7";
 
 let cloudBaseUrl = "wss://nexusha.app/tunnel";
 try {
@@ -12,7 +13,7 @@ try {
   if (opts.cloud_url) cloudBaseUrl = opts.cloud_url;
 } catch (e) {}
 
-let state = { status: "connecting", code: null, agentId: null };
+let state = { status: "connecting", code: null, agentId: null, version: ADDON_VERSION };
 
 function getCreds() {
   try {
@@ -200,6 +201,50 @@ async function runScene(message) {
     executedCount += 1;
   }
   return { ok: true, executedCount };
+}
+
+function reportVersion(ws) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(JSON.stringify({
+      type: "addon_version",
+      version: ADDON_VERSION,
+      agentId: state.agentId || null
+    }));
+  } catch (e) {}
+}
+
+function updateAddonReply(ws, reqId, ok, error, action) {
+  const message = {
+    type: "update_addon_result",
+    reqId,
+    ok: Boolean(ok),
+    version: ADDON_VERSION
+  };
+  if (action) message.action = action;
+  if (!ok) message.error = String(error || "Güncelleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
+  try { ws.send(JSON.stringify(message)); } catch (e) {}
+}
+
+function supervisorOk(result) {
+  return result && result.status >= 200 && result.status < 300;
+}
+
+async function updateAddon() {
+  const reloaded = await supervisorPost("/store/reload", {});
+  if (!supervisorOk(reloaded)) {
+    const detail = String(reloaded && reloaded.body || "").replace(/\s+/g, " ").trim().slice(0, 160);
+    throw new Error(detail || "Store yenilenemedi.");
+  }
+  const updated = await supervisorPost("/addons/self/update", {});
+  if (supervisorOk(updated)) return { ok: true, action: "update" };
+  const rebuilt = await supervisorPost("/addons/self/rebuild", {});
+  if (supervisorOk(rebuilt)) return { ok: true, action: "rebuild" };
+  const detail = String((updated && updated.body) || (rebuilt && rebuilt.body) || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+  throw new Error(detail || "Eklenti güncellemesi görünmüyor ve rebuild başarısız.");
 }
 
 function haCommandSocket() {
@@ -404,12 +449,14 @@ function connect() {
 
   ws.on("open", () => {
     state.status = "connected";
-    if (creds) console.log("[NexusHA] Tunel aktif:", creds.agentId);
+    if (creds) console.log("[NexusHA] Tunel aktif:", creds.agentId, "v" + ADDON_VERSION);
+    else console.log("[NexusHA] Tunel baglandi, surum:", ADDON_VERSION);
+    reportVersion(ws);
     if (keepAlive) clearInterval(keepAlive);
     keepAlive = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return;
       try { ws.ping(); } catch (e) {}
-      try { ws.send(JSON.stringify({ type: "ping" })); } catch (e) {}
+      try { ws.send(JSON.stringify({ type: "ping", version: ADDON_VERSION })); } catch (e) {}
     }, 20000);
   });
 
@@ -428,7 +475,8 @@ function connect() {
         fs.writeFileSync(PAIR_FILE, JSON.stringify({ agentId: r.agentId, secret: r.secret }));
         state.agentId = r.agentId;
         state.code = null;
-        return console.log("[NexusHA] Eslesme basarili:", r.agentId);
+        reportVersion(ws);
+        return console.log("[NexusHA] Eslesme basarili:", r.agentId, "v" + ADDON_VERSION);
       }
 
       if (r.type === "save_ha_automation") {
@@ -442,6 +490,13 @@ function connect() {
         runScene(r)
           .then((result) => sceneReply(ws, r.reqId, true, "", result.executedCount))
           .catch((err) => sceneReply(ws, r.reqId, false, err.message, 0));
+        return;
+      }
+
+      if (r.type === "update_addon") {
+        updateAddon()
+          .then((result) => updateAddonReply(ws, r.reqId, true, "", result.action))
+          .catch((err) => updateAddonReply(ws, r.reqId, false, err.message));
         return;
       }
 
