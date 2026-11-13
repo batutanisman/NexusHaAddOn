@@ -1,6 +1,6 @@
 name: "NexusHA Cloud Bridge"
 description: "Port acmadan NexusHA bulut sunucusuna guvenli ters tunel baglantisi."
-version: "1.3.5"
+version: "1.3.6"
 slug: "nexusha_bridge"
 init: false
 arch:
