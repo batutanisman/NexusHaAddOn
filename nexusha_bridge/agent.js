@@ -18,7 +18,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.4.7";
+  return "1.4.8";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -619,6 +619,7 @@ async function restoreHaBackup(ws, message) {
   const downloadUrl = String(message && message.downloadUrl || "").trim();
   const authToken = String(message && message.authToken || message.token || "").trim();
   const backupId = String(message && message.backupId || "").trim();
+  const dryRun = message && message.dryRun === true;
   if (!downloadUrl) throw new Error("İndirme adresi eksik.");
 
   const backupDir = fs.existsSync("/backup") ? "/backup" : "/tmp";
@@ -626,8 +627,22 @@ async function restoreHaBackup(ws, message) {
   let slug = "";
   let keepPath = "";
   try {
-    reportBackupProgress(ws, "download", 15, "Yedek dosyası buluttan /backup dizinine stream ediliyor...");
+    reportBackupProgress(ws, "download", 15, dryRun
+      ? "Dry-run: yedek dosyası /backup dizinine stream ediliyor..."
+      : "Yedek dosyası buluttan /backup dizinine stream ediliyor...");
     await downloadRemoteFile(downloadUrl, authToken, destPath);
+    let sizeBytes = 0;
+    try { sizeBytes = fs.statSync(destPath).size; } catch (e) { sizeBytes = 0; }
+    const sizeMB = (sizeBytes / (1024 * 1024)).toFixed(1);
+    console.log("[NexusHA] Restore indirme tamamlandı:", destPath, sizeMB + " MB", dryRun ? "(dryRun)" : "");
+
+    if (dryRun) {
+      console.log("[RestoreDryRun] Başarılı: Dosya /backup/ dizinine indirildi, Supervisor restore atlandı.");
+      reportBackupProgress(ws, "done", 100, `Dry-run başarılı (${sizeMB} MB). Supervisor restore atlandı.`);
+      try { fs.unlinkSync(destPath); } catch (e) {}
+      return { ok: true, status: "dry_run", dryRun: true, sizeMB, backupId, path: destPath };
+    }
+
     const registered = await registerBackupFromDisk(destPath, `NexusHA_Restore_${backupId || Date.now()}.tar`);
     slug = registered.slug;
     keepPath = registered.path || destPath;
@@ -649,13 +664,14 @@ async function restoreHaBackup(ws, message) {
 
     reportBackupProgress(ws, "done", 100, "Geri yükleme başlatıldı; Home Assistant yeniden başlıyor...");
     console.log("[NexusHA] HA restore tetiklendi:", slug, backupId || "");
-    return { ok: true, status: "restoring", slug, backupId };
+    return { ok: true, status: "restoring", slug, backupId, sizeMB };
   } catch (error) {
     const messageText = String(error && error.message || error || "Geri yükleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
     reportBackupProgress(ws, "error", 0, messageText);
     throw new Error(messageText);
   } finally {
     // Registered slug.tar should remain for Supervisor restore; remove only failed temp names.
+    // dryRun already deletes destPath above; this covers error paths.
     if (destPath && (!keepPath || path.resolve(destPath) !== path.resolve(keepPath))) {
       try { fs.unlinkSync(destPath); } catch (e) {}
     }
@@ -1208,7 +1224,9 @@ function connect() {
           .then((result) => restoreReply(ws, r.reqId, true, "", {
             status: result.status || "restoring",
             slug: result.slug || "",
-            backupId: result.backupId || ""
+            backupId: result.backupId || "",
+            dryRun: result.dryRun === true,
+            sizeMB: result.sizeMB || ""
           }))
           .catch((err) => restoreReply(ws, r.reqId, false, err.message));
         return;
