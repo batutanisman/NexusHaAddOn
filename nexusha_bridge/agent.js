@@ -18,15 +18,19 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.4.3";
+  return "1.4.5";
 }
 
 const ADDON_VERSION = readAddonVersion();
 
 let cloudBaseUrl = "wss://nexusha.app/tunnel";
+let uploadBaseUrl = "";
+const BACKUP_CHUNK_BYTES = 20 * 1024 * 1024;
+let backupChunkMaxBytes = BACKUP_CHUNK_BYTES;
 try {
   const opts = JSON.parse(fs.readFileSync(OPTIONS_FILE, "utf8"));
   if (opts.cloud_url) cloudBaseUrl = opts.cloud_url;
+  if (opts.upload_url) uploadBaseUrl = String(opts.upload_url || "").trim();
 } catch (e) {}
 
 let state = { status: "connecting", code: null, agentId: null, version: ADDON_VERSION, addonVersion: ADDON_VERSION };
@@ -240,6 +244,31 @@ function cloudHttpBase() {
     .replace(/^ws:/i, "http:")
     .replace(/\/tunnel\/?$/i, "")
     .replace(/\/$/, "") || "https://nexusha.app";
+}
+
+function cloudUploadBase() {
+  const custom = String(uploadBaseUrl || "").trim();
+  if (custom) return custom.replace(/\/$/, "");
+  return cloudHttpBase();
+}
+
+function parseUploadTarget(pathname) {
+  const base = cloudUploadBase();
+  const target = new URL(pathname, base.endsWith("/") ? base : base + "/");
+  const isIp = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(target.hostname);
+  return {
+    target,
+    lib: target.protocol === "https:" ? https : http,
+    // Cloudflare 100MB limitini aşmak için origin IP kullanıldığında SNI = nexusha.app
+    requestOptions: {
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === "https:" ? 443 : 80),
+      path: target.pathname + target.search,
+      servername: isIp ? "nexusha.app" : target.hostname,
+      headers: isIp ? { Host: "nexusha.app" } : {}
+    }
+  };
 }
 
 function automationReply(ws, reqId, ok, error, category) {
@@ -571,35 +600,27 @@ async function restoreHaBackup(ws, message) {
   }
 }
 
-async function uploadBackupToCloud(agentId, secret, slug, downloadStream) {
-  const target = new URL(`/api/homes/${encodeURIComponent(agentId)}/upload-ha-backup`, cloudHttpBase());
-  const lib = target.protocol === "https:" ? https : http;
+function requestUploadBinary(method, pathname, headers, bodyBuf) {
+  const { lib, requestOptions } = parseUploadTarget(pathname);
+  const payload = bodyBuf == null ? null : Buffer.isBuffer(bodyBuf) ? bodyBuf : Buffer.from(String(bodyBuf || ""));
   return new Promise((resolve, reject) => {
     const req = lib.request({
-      protocol: target.protocol,
-      hostname: target.hostname,
-      port: target.port || (target.protocol === "https:" ? 443 : 80),
-      path: target.pathname + target.search,
-      method: "POST",
+      ...requestOptions,
+      method,
       headers: {
-        "Content-Type": "application/x-tar",
-        "X-Agent-Id": agentId,
-        "X-Agent-Secret": secret || "",
-        "X-Backup-Slug": slug,
-        "X-Backup-Name": "NexusHA_Auto_Backup",
-        "Transfer-Encoding": "chunked"
+        ...(requestOptions.headers || {}),
+        ...(headers || {}),
+        ...(payload ? { "Content-Length": String(payload.length) } : { "Content-Length": "0" })
       },
       timeout: 30 * 60 * 1000
     }, (res) => {
       const chunks = [];
       res.on("data", (d) => chunks.push(d));
       res.on("end", () => {
-        const body = Buffer.concat(chunks).toString("utf8");
-        if ((res.statusCode || 500) >= 200 && (res.statusCode || 500) < 300) {
-          resolve({ status: res.statusCode, body });
-          return;
-        }
-        reject(new Error(String(body || `Bulut yükleme reddedildi (${res.statusCode}).`).replace(/\s+/g, " ").trim().slice(0, 180)));
+        resolve({
+          status: res.statusCode || 500,
+          body: Buffer.concat(chunks).toString("utf8")
+        });
       });
     });
     req.on("timeout", () => {
@@ -607,12 +628,93 @@ async function uploadBackupToCloud(agentId, secret, slug, downloadStream) {
       reject(new Error("Bulut yükleme zaman aşımına uğradı."));
     });
     req.on("error", reject);
-    downloadStream.on("error", (error) => {
-      try { req.destroy(); } catch (e) {}
+    if (payload && payload.length) req.write(payload);
+    req.end();
+  });
+}
+
+function streamToFile(readable, destPath) {
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(destPath);
+    let size = 0;
+    readable.on("data", (chunk) => { size += chunk.length || 0; });
+    readable.on("error", (error) => {
+      try { out.destroy(); } catch (e) {}
       reject(error);
     });
-    downloadStream.pipe(req);
+    out.on("error", reject);
+    out.on("finish", () => resolve(size));
+    readable.pipe(out);
   });
+}
+
+function readFileSlice(filePath, start, end) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const stream = fs.createReadStream(filePath, { start, end });
+    stream.on("data", (d) => chunks.push(d));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+async function uploadBackupChunked(ws, agentId, secret, slug, localTarPath, fileSize) {
+  const chunkSize = BACKUP_CHUNK_BYTES;
+  const totalChunks = Math.max(1, Math.ceil(Number(fileSize || 0) / chunkSize));
+  const uploadId = crypto.randomUUID();
+  const fileName = "NexusHA_Auto_Backup.tar";
+  const basePath = `/api/homes/${encodeURIComponent(agentId)}`;
+
+  reportBackupProgress(ws, "upload", 50, `Yedek buluta parçalı aktarılıyor (0/${totalChunks})...`);
+
+  for (let index = 0; index < totalChunks; index++) {
+    const start = index * chunkSize;
+    const end = Math.min(start + chunkSize, fileSize) - 1;
+    const piece = fileSize > 0 ? await readFileSlice(localTarPath, start, end) : Buffer.alloc(0);
+    const part = await requestUploadBinary(
+      "POST",
+      `${basePath}/upload-ha-backup-chunk`,
+      {
+        "Content-Type": "application/octet-stream",
+        "X-Agent-Id": agentId,
+        "X-Agent-Secret": secret || "",
+        "X-Backup-Slug": slug || "",
+        "x-upload-id": uploadId,
+        "x-chunk-index": String(index),
+        "x-total-chunks": String(totalChunks),
+        "x-filename": fileName
+      },
+      piece
+    );
+    if (part.status >= 300) {
+      throw new Error(String(part.body || `Parça yükleme reddedildi (${part.status}).`).replace(/\s+/g, " ").trim().slice(0, 180));
+    }
+    const percent = Math.round(50 + (40 * ((index + 1) / totalChunks)));
+    reportBackupProgress(
+      ws,
+      "upload",
+      Math.min(90, Math.max(50, percent)),
+      `Yedek parçası gönderildi (${index + 1}/${totalChunks})...`
+    );
+  }
+
+  const done = await requestUploadBinary(
+    "POST",
+    `${basePath}/upload-ha-backup-complete`,
+    {
+      "Content-Type": "application/json",
+      "X-Agent-Id": agentId,
+      "X-Agent-Secret": secret || "",
+      "x-upload-id": uploadId,
+      "x-filename": fileName,
+      "x-total-chunks": String(totalChunks)
+    },
+    "{}"
+  );
+  if (done.status >= 300) {
+    throw new Error(String(done.body || `Yükleme tamamlanamadı (${done.status}).`).replace(/\s+/g, " ").trim().slice(0, 180));
+  }
+  return done;
 }
 
 async function createHaBackup(ws) {
@@ -623,6 +725,7 @@ async function createHaBackup(ws) {
   if (!agentId) throw new Error("Eşleşme yok; yedek yüklenemez.");
 
   let slug = "";
+  const tmpPath = path.join("/tmp", `nexusha-backup-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tar`);
   try {
     reportBackupProgress(ws, "create", 15, "Home Assistant tam yedeği oluşturuluyor...");
     const created = await supervisorRequestLong("POST", "/backups/new/full", {
@@ -636,18 +739,21 @@ async function createHaBackup(ws) {
     slug = String(data && data.slug || "").trim();
     if (!slug) throw new Error("Yedek slug değeri okunamadı.");
 
-    reportBackupProgress(ws, "upload", 60, "Yedek buluta aktarılıyor...");
+    reportBackupProgress(ws, "download", 45, "Yedek dosyası hazırlanıyor...");
     const download = await supervisorDownloadStream(`/backups/${encodeURIComponent(slug)}/download`);
-    await uploadBackupToCloud(agentId, secret, slug, download);
+    const size = await streamToFile(download, tmpPath);
+    if (!size) throw new Error("Boş yedek dosyası.");
 
-    reportBackupProgress(ws, "cleanup", 90, "Geçici yedek temizleniyor...");
+    await uploadBackupChunked(ws, agentId, secret, slug, tmpPath, size);
+
+    reportBackupProgress(ws, "cleanup", 92, "Geçici yedek temizleniyor...");
     const removed = await supervisorDelete(`/backups/${encodeURIComponent(slug)}`);
     if (!supervisorOk(removed)) {
       console.log("[NexusHA] Geçici yedek silinemedi:", supervisorErrorText(removed, ""));
     }
 
     reportBackupProgress(ws, "done", 100, "Yedekleme tamamlandı!");
-    console.log("[NexusHA] HA yedek yüklendi:", slug);
+    console.log("[NexusHA] HA yedek yüklendi:", slug, "chunks@", BACKUP_CHUNK_BYTES);
     return { ok: true, status: "completed", slug };
   } catch (error) {
     if (slug) {
@@ -656,6 +762,8 @@ async function createHaBackup(ws) {
     const message = String(error && error.message || error || "Yedekleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
     reportBackupProgress(ws, "error", 0, message);
     throw new Error(message);
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch (e) {}
   }
 }
 
@@ -982,6 +1090,12 @@ function connect() {
       if (r.type === "pair_code") {
         state.code = r.code;
         return console.log("[NexusHA] Eslesme Kodu:", r.code);
+      }
+
+      if (r.type === "server_config") {
+        if (r.uploadBaseUrl) uploadBaseUrl = String(r.uploadBaseUrl).trim();
+        if (Number(r.backupChunkMaxBytes) > 0) backupChunkMaxBytes = Number(r.backupChunkMaxBytes);
+        return console.log("[NexusHA] Upload base:", uploadBaseUrl || cloudHttpBase());
       }
 
       if (r.type === "paired") {
