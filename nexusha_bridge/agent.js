@@ -15,7 +15,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.3.9";
+  return "1.4.1";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -322,9 +322,9 @@ function pickNexusUpdateEntity(states) {
   return ready || matches[0];
 }
 
-async function fetchHaStates() {
+async function fetchFreshHaStates() {
   try {
-    const link = await haCommandSocket({ connectTimeout: 12000, commandTimeout: 15000 });
+    const link = await haCommandSocket({ connectTimeout: 12000, commandTimeout: 20000 });
     try {
       const states = await link.send("get_states");
       return Array.isArray(states) ? states : [];
@@ -336,9 +336,16 @@ async function fetchHaStates() {
     if (!supervisorOk(result)) {
       throw new Error(supervisorErrorText(result, wsError && wsError.message || "Durumlar alınamadı."));
     }
-    const parsed = parseSupervisorJson(result);
+    let parsed = parseSupervisorJson(result);
+    if (!Array.isArray(parsed)) {
+      try { parsed = JSON.parse(result.body || "[]"); } catch (e) { parsed = []; }
+    }
     return Array.isArray(parsed) ? parsed : [];
   }
+}
+
+async function fetchHaStates() {
+  return fetchFreshHaStates();
 }
 
 async function updateAddon(ws) {
@@ -525,7 +532,7 @@ async function saveHaAutomation(message) {
 
 let tunnel = null;
 const STATE_DOMAINS = new Set([
-  "light", "switch", "climate", "cover", "lock", "fan", "media_player",
+  "light", "switch", "climate", "cover", "lock", "fan", "media_player", "remote",
   "vacuum", "binary_sensor", "person", "alarm_control_panel", "automation", "scene"
 ]);
 
@@ -662,7 +669,49 @@ function connect() {
         return;
       }
 
+      if (r.type === "scan_devices" || r.type === "get_states") {
+        fetchFreshHaStates()
+          .then((states) => {
+            ws.send(JSON.stringify({
+              type: "scan_devices_result",
+              reqId: r.reqId || r.requestId,
+              ok: true,
+              states
+            }));
+          })
+          .catch((err) => {
+            ws.send(JSON.stringify({
+              type: "scan_devices_result",
+              reqId: r.reqId || r.requestId,
+              ok: false,
+              error: String(err && err.message || "Durumlar alınamadı.").slice(0, 180)
+            }));
+          });
+        return;
+      }
+
       if (!r.path) return;
+      const method = String(r.method || "GET").toUpperCase();
+      const cleanPath = String(r.path || "").split("?")[0].replace(/\/+$/, "") || "/";
+      if (method === "GET" && (cleanPath === "/api/states" || cleanPath === "/states")) {
+        fetchFreshHaStates()
+          .then((states) => {
+            ws.send(JSON.stringify({
+              requestId: r.requestId,
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(Array.isArray(states) ? states : [])
+            }));
+          })
+          .catch((err) => {
+            ws.send(JSON.stringify({
+              requestId: r.requestId,
+              status: 502,
+              body: String(err && err.message || "Durumlar alınamadı.")
+            }));
+          });
+        return;
+      }
       const targetPath = r.path.startsWith("/api") ? `/core${r.path}` : `/core/api${r.path}`;
       const haReq = http.request({
         hostname: "supervisor",
@@ -671,7 +720,8 @@ function connect() {
         method: r.method || "GET",
         headers: {
           "Authorization": `Bearer ${TOKEN}`,
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          "Cache-Control": "no-cache"
         }
       }, (haRes) => {
         const chunks = [];
