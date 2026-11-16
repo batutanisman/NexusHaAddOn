@@ -1,5 +1,6 @@
 const WebSocket = require("ws");
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 
 const TOKEN = process.env.SUPERVISOR_TOKEN;
@@ -15,7 +16,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.4.1";
+  return "1.4.2";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -164,6 +165,81 @@ function supervisorGet(urlPath) {
   return supervisorRequest("GET", urlPath);
 }
 
+function supervisorDelete(urlPath) {
+  return supervisorRequest("DELETE", urlPath);
+}
+
+function supervisorRequestLong(method, urlPath, payload, timeoutMs) {
+  const hasBody = payload !== undefined;
+  const data = hasBody ? JSON.stringify(payload == null ? {} : payload) : "";
+  return new Promise((resolve, reject) => {
+    const headers = { Authorization: `Bearer ${TOKEN}` };
+    if (hasBody) {
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = Buffer.byteLength(data);
+    }
+    const req = http.request({
+      hostname: "supervisor",
+      port: 80,
+      path: urlPath,
+      method: method || "GET",
+      headers,
+      timeout: timeoutMs || 30 * 60 * 1000
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => resolve({ status: res.statusCode || 500, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Supervisor isteği zaman aşımına uğradı."));
+    });
+    req.on("error", reject);
+    if (hasBody) req.write(data);
+    req.end();
+  });
+}
+
+function supervisorDownloadStream(urlPath) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: "supervisor",
+      port: 80,
+      path: urlPath,
+      method: "GET",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      timeout: 30 * 60 * 1000
+    }, (res) => {
+      if ((res.statusCode || 500) >= 400) {
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
+        res.on("end", () => {
+          reject(new Error(supervisorErrorText(
+            { status: res.statusCode, body: Buffer.concat(chunks).toString("utf8") },
+            "Yedek indirilemedi."
+          )));
+        });
+        return;
+      }
+      resolve(res);
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Yedek indirme zaman aşımına uğradı."));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+function cloudHttpBase() {
+  return String(cloudBaseUrl || "wss://nexusha.app/tunnel")
+    .replace(/^wss:/i, "https:")
+    .replace(/^ws:/i, "http:")
+    .replace(/\/tunnel\/?$/i, "")
+    .replace(/\/$/, "") || "https://nexusha.app";
+}
+
 function automationReply(ws, reqId, ok, error, category) {
   const message = { type: "save_ha_automation_result", reqId, ok: Boolean(ok) };
   if (!ok) message.error = String(error || "Kayıt başarısız.");
@@ -309,6 +385,122 @@ function reportUpdateProgress(ws, step, percent, message) {
       agentId: state.agentId || null
     }));
   } catch (e) {}
+}
+
+function reportBackupProgress(ws, step, percent, message) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(JSON.stringify({
+      type: "ha_backup_progress",
+      step: String(step || ""),
+      percent: Number(percent) || 0,
+      message: String(message || "").replace(/\s+/g, " ").trim().slice(0, 180),
+      addonVersion: ADDON_VERSION,
+      version: ADDON_VERSION,
+      agentId: state.agentId || null
+    }));
+  } catch (e) {}
+}
+
+function backupReply(ws, reqId, ok, error, extra) {
+  const message = {
+    type: "create_ha_backup_result",
+    reqId,
+    ok: Boolean(ok),
+    addonVersion: ADDON_VERSION,
+    version: ADDON_VERSION
+  };
+  if (extra && typeof extra === "object") Object.assign(message, extra);
+  if (!ok) message.error = String(error || "Yedekleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
+  try { ws.send(JSON.stringify(message)); } catch (e) {}
+}
+
+async function uploadBackupToCloud(agentId, secret, slug, downloadStream) {
+  const target = new URL(`/api/homes/${encodeURIComponent(agentId)}/upload-ha-backup`, cloudHttpBase());
+  const lib = target.protocol === "https:" ? https : http;
+  return new Promise((resolve, reject) => {
+    const req = lib.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === "https:" ? 443 : 80),
+      path: target.pathname + target.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-tar",
+        "X-Agent-Id": agentId,
+        "X-Agent-Secret": secret || "",
+        "X-Backup-Slug": slug,
+        "X-Backup-Name": "NexusHA_Auto_Backup",
+        "Transfer-Encoding": "chunked"
+      },
+      timeout: 30 * 60 * 1000
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => {
+        const body = Buffer.concat(chunks).toString("utf8");
+        if ((res.statusCode || 500) >= 200 && (res.statusCode || 500) < 300) {
+          resolve({ status: res.statusCode, body });
+          return;
+        }
+        reject(new Error(String(body || `Bulut yükleme reddedildi (${res.statusCode}).`).replace(/\s+/g, " ").trim().slice(0, 180)));
+      });
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Bulut yükleme zaman aşımına uğradı."));
+    });
+    req.on("error", reject);
+    downloadStream.on("error", (error) => {
+      try { req.destroy(); } catch (e) {}
+      reject(error);
+    });
+    downloadStream.pipe(req);
+  });
+}
+
+async function createHaBackup(ws) {
+  if (!TOKEN) throw new Error("SUPERVISOR_TOKEN yok.");
+  const creds = getCreds();
+  const agentId = (creds && creds.agentId) || state.agentId || "";
+  const secret = (creds && creds.secret) || "";
+  if (!agentId) throw new Error("Eşleşme yok; yedek yüklenemez.");
+
+  let slug = "";
+  try {
+    reportBackupProgress(ws, "create", 15, "Home Assistant tam yedeği oluşturuluyor...");
+    const created = await supervisorRequestLong("POST", "/backups/new/full", {
+      name: "NexusHA_Auto_Backup"
+    }, 45 * 60 * 1000);
+    if (!supervisorOk(created)) {
+      throw new Error(supervisorErrorText(created, "Tam yedek oluşturulamadı."));
+    }
+    const payload = parseSupervisorJson(created);
+    const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
+    slug = String(data && data.slug || "").trim();
+    if (!slug) throw new Error("Yedek slug değeri okunamadı.");
+
+    reportBackupProgress(ws, "upload", 60, "Yedek buluta aktarılıyor...");
+    const download = await supervisorDownloadStream(`/backups/${encodeURIComponent(slug)}/download`);
+    await uploadBackupToCloud(agentId, secret, slug, download);
+
+    reportBackupProgress(ws, "cleanup", 90, "Geçici yedek temizleniyor...");
+    const removed = await supervisorDelete(`/backups/${encodeURIComponent(slug)}`);
+    if (!supervisorOk(removed)) {
+      console.log("[NexusHA] Geçici yedek silinemedi:", supervisorErrorText(removed, ""));
+    }
+
+    reportBackupProgress(ws, "done", 100, "Yedekleme tamamlandı!");
+    console.log("[NexusHA] HA yedek yüklendi:", slug);
+    return { ok: true, status: "completed", slug };
+  } catch (error) {
+    if (slug) {
+      try { await supervisorDelete(`/backups/${encodeURIComponent(slug)}`); } catch (e) {}
+    }
+    const message = String(error && error.message || error || "Yedekleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
+    reportBackupProgress(ws, "error", 0, message);
+    throw new Error(message);
+  }
 }
 
 function pickNexusUpdateEntity(states) {
@@ -666,6 +858,16 @@ function connect() {
             action: result.action || ""
           }))
           .catch((err) => updateAddonReply(ws, r.reqId, false, err.message));
+        return;
+      }
+
+      if (r.type === "create_ha_backup") {
+        createHaBackup(ws)
+          .then((result) => backupReply(ws, r.reqId, true, "", {
+            status: result.status || "completed",
+            slug: result.slug || ""
+          }))
+          .catch((err) => backupReply(ws, r.reqId, false, err.message));
         return;
       }
 
