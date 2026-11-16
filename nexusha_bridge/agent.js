@@ -18,7 +18,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.4.6";
+  return "1.4.7";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -552,6 +552,68 @@ function supervisorUploadBackupTar(filePath, fileName) {
   });
 }
 
+function extractHaBackupSlug(tarPath) {
+  let fd = null;
+  try {
+    fd = fs.openSync(tarPath, "r");
+    const header = Buffer.alloc(512);
+    let offset = 0;
+    for (let i = 0; i < 96; i++) {
+      const read = fs.readSync(fd, header, 0, 512, offset);
+      if (read < 512) break;
+      offset += 512;
+      if (header.every((byte) => byte === 0)) break;
+      const name = header.toString("utf8", 0, 100).replace(/\0.*$/, "").replace(/^\.\//, "");
+      const size = parseInt(header.toString("utf8", 124, 136).replace(/\0.*$/, "").trim(), 8) || 0;
+      const padded = Math.ceil(size / 512) * 512;
+      const base = name.split("/").pop();
+      if (base === "backup.json" || base === "snapshot.json") {
+        const data = Buffer.alloc(size);
+        fs.readSync(fd, data, 0, size, offset);
+        try {
+          const json = JSON.parse(data.toString("utf8"));
+          const slug = String(json && json.slug || "").trim();
+          if (slug) return slug;
+        } catch (e) {}
+      }
+      offset += padded;
+    }
+  } catch (e) {
+  } finally {
+    if (fd != null) try { fs.closeSync(fd); } catch (e) {}
+  }
+  return "";
+}
+
+async function registerBackupFromDisk(filePath, fileName) {
+  let slug = extractHaBackupSlug(filePath);
+  if (slug) {
+    const finalPath = path.join("/backup", `${slug}.tar`);
+    if (path.resolve(finalPath) !== path.resolve(filePath)) {
+      try {
+        fs.renameSync(filePath, finalPath);
+      } catch (e) {
+        fs.copyFileSync(filePath, finalPath);
+        try { fs.unlinkSync(filePath); } catch (err) {}
+      }
+    }
+    const reloaded = await supervisorRequest("POST", "/backups/reload", {});
+    if (!supervisorOk(reloaded)) {
+      throw new Error(supervisorErrorText(reloaded, "Yedek listesi yenilenemedi."));
+    }
+    return { slug, path: finalPath };
+  }
+  const uploaded = await supervisorUploadBackupTar(filePath, fileName);
+  if (!supervisorOk(uploaded)) {
+    throw new Error(supervisorErrorText(uploaded, "Yedek Supervisor'a yüklenemedi."));
+  }
+  const payload = parseSupervisorJson(uploaded);
+  const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
+  slug = String(data && data.slug || "").trim();
+  if (!slug) throw new Error("Yüklenen yedek slug değeri okunamadı.");
+  return { slug, path: filePath };
+}
+
 async function restoreHaBackup(ws, message) {
   if (!TOKEN) throw new Error("SUPERVISOR_TOKEN yok.");
   const downloadUrl = String(message && message.downloadUrl || "").trim();
@@ -559,19 +621,16 @@ async function restoreHaBackup(ws, message) {
   const backupId = String(message && message.backupId || "").trim();
   if (!downloadUrl) throw new Error("İndirme adresi eksik.");
 
-  const tmpPath = path.join("/tmp", `ha-restore-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tar`);
+  const backupDir = fs.existsSync("/backup") ? "/backup" : "/tmp";
+  const destPath = path.join(backupDir, `nexusha-restore-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tar`);
   let slug = "";
+  let keepPath = "";
   try {
-    reportBackupProgress(ws, "download", 15, "Yedek dosyası buluttan Home Assistant'a indiriliyor...");
-    await downloadRemoteFile(downloadUrl, authToken, tmpPath);
-    const uploaded = await supervisorUploadBackupTar(tmpPath, `NexusHA_Restore_${backupId || Date.now()}.tar`);
-    if (!supervisorOk(uploaded)) {
-      throw new Error(supervisorErrorText(uploaded, "Yedek Supervisor'a yüklenemedi."));
-    }
-    const payload = parseSupervisorJson(uploaded);
-    const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
-    slug = String(data && data.slug || "").trim();
-    if (!slug) throw new Error("Yüklenen yedek slug değeri okunamadı.");
+    reportBackupProgress(ws, "download", 15, "Yedek dosyası buluttan /backup dizinine stream ediliyor...");
+    await downloadRemoteFile(downloadUrl, authToken, destPath);
+    const registered = await registerBackupFromDisk(destPath, `NexusHA_Restore_${backupId || Date.now()}.tar`);
+    slug = registered.slug;
+    keepPath = registered.path || destPath;
 
     reportBackupProgress(ws, "restore", 60, "Home Assistant tam geri yüklemesi başlatılıyor (3-5 dk sürebilir)...");
     try {
@@ -596,7 +655,10 @@ async function restoreHaBackup(ws, message) {
     reportBackupProgress(ws, "error", 0, messageText);
     throw new Error(messageText);
   } finally {
-    try { fs.unlinkSync(tmpPath); } catch (e) {}
+    // Registered slug.tar should remain for Supervisor restore; remove only failed temp names.
+    if (destPath && (!keepPath || path.resolve(destPath) !== path.resolve(keepPath))) {
+      try { fs.unlinkSync(destPath); } catch (e) {}
+    }
   }
 }
 

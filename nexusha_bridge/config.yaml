@@ -1,6 +1,6 @@
 name: "NexusHA Cloud Bridge"
 description: "Port acmadan NexusHA bulut sunucusuna guvenli ters tunel baglantisi."
-version: "1.4.6"
+version: "1.4.7"
 slug: "nexusha_bridge"
 init: false
 arch:
@@ -11,6 +11,8 @@ boot: auto
 homeassistant_api: true
 hassio_api: true
 hassio_role: manager
+map:
+  - backup:rw
 ingress: true
 ingress_port: 8099
 panel_icon: "mdi:cloud-check"
