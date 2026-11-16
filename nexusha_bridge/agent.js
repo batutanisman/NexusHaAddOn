@@ -2,6 +2,8 @@ const WebSocket = require("ws");
 const http = require("http");
 const https = require("https");
 const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 
 const TOKEN = process.env.SUPERVISOR_TOKEN;
 const PAIR_FILE = "/data/pairing.json";
@@ -16,7 +18,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.4.2";
+  return "1.4.3";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -413,6 +415,160 @@ function backupReply(ws, reqId, ok, error, extra) {
   if (extra && typeof extra === "object") Object.assign(message, extra);
   if (!ok) message.error = String(error || "Yedekleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
   try { ws.send(JSON.stringify(message)); } catch (e) {}
+}
+
+function restoreReply(ws, reqId, ok, error, extra) {
+  const message = {
+    type: "restore_ha_backup_result",
+    reqId,
+    ok: Boolean(ok),
+    addonVersion: ADDON_VERSION,
+    version: ADDON_VERSION
+  };
+  if (extra && typeof extra === "object") Object.assign(message, extra);
+  if (!ok) message.error = String(error || "Geri yükleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
+  try { ws.send(JSON.stringify(message)); } catch (e) {}
+}
+
+function downloadRemoteFile(downloadUrl, authToken, destPath, redirectsLeft) {
+  const left = redirectsLeft == null ? 5 : redirectsLeft;
+  const target = new URL(String(downloadUrl || ""));
+  const lib = target.protocol === "https:" ? https : http;
+  return new Promise((resolve, reject) => {
+    const req = lib.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === "https:" ? 443 : 80),
+      path: target.pathname + target.search,
+      method: "GET",
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      timeout: 45 * 60 * 1000
+    }, (res) => {
+      const status = res.statusCode || 500;
+      if (status >= 300 && status < 400 && res.headers.location && left > 0) {
+        res.resume();
+        const nextUrl = new URL(res.headers.location, target).toString();
+        downloadRemoteFile(nextUrl, authToken, destPath, left - 1).then(resolve, reject);
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
+        res.on("end", () => {
+          reject(new Error(String(Buffer.concat(chunks).toString("utf8") || `İndirme reddedildi (${status}).`).replace(/\s+/g, " ").trim().slice(0, 180)));
+        });
+        return;
+      }
+      const out = fs.createWriteStream(destPath);
+      res.pipe(out);
+      out.on("finish", () => resolve(destPath));
+      out.on("error", reject);
+      res.on("error", reject);
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Yedek indirme zaman aşımına uğradı."));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+function supervisorUploadBackupTar(filePath, fileName) {
+  const boundary = "----NexusHABackup" + crypto.randomBytes(12).toString("hex");
+  const safeName = String(fileName || "NexusHA_Restore.tar").replace(/[^\w.\-]+/g, "_");
+  const prelude = Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="file"; filename="${safeName}"\r\n` +
+    `Content-Type: application/x-tar\r\n\r\n`
+  );
+  const epilogue = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const size = fs.statSync(filePath).size;
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: "supervisor",
+      port: 80,
+      path: "/backups/new/upload",
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": String(prelude.length + size + epilogue.length)
+      },
+      timeout: 45 * 60 * 1000
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => resolve({
+        status: res.statusCode || 500,
+        body: Buffer.concat(chunks).toString("utf8")
+      }));
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Supervisor yedek yükleme zaman aşımına uğradı."));
+    });
+    req.on("error", reject);
+    req.write(prelude);
+    const stream = fs.createReadStream(filePath);
+    stream.on("error", (error) => {
+      try { req.destroy(); } catch (e) {}
+      reject(error);
+    });
+    stream.on("end", () => {
+      req.write(epilogue);
+      req.end();
+    });
+    stream.pipe(req, { end: false });
+  });
+}
+
+async function restoreHaBackup(ws, message) {
+  if (!TOKEN) throw new Error("SUPERVISOR_TOKEN yok.");
+  const downloadUrl = String(message && message.downloadUrl || "").trim();
+  const authToken = String(message && message.authToken || message.token || "").trim();
+  const backupId = String(message && message.backupId || "").trim();
+  if (!downloadUrl) throw new Error("İndirme adresi eksik.");
+
+  const tmpPath = path.join("/tmp", `ha-restore-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tar`);
+  let slug = "";
+  try {
+    reportBackupProgress(ws, "download", 15, "Yedek dosyası buluttan Home Assistant'a indiriliyor...");
+    await downloadRemoteFile(downloadUrl, authToken, tmpPath);
+    const uploaded = await supervisorUploadBackupTar(tmpPath, `NexusHA_Restore_${backupId || Date.now()}.tar`);
+    if (!supervisorOk(uploaded)) {
+      throw new Error(supervisorErrorText(uploaded, "Yedek Supervisor'a yüklenemedi."));
+    }
+    const payload = parseSupervisorJson(uploaded);
+    const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
+    slug = String(data && data.slug || "").trim();
+    if (!slug) throw new Error("Yüklenen yedek slug değeri okunamadı.");
+
+    reportBackupProgress(ws, "restore", 60, "Home Assistant tam geri yüklemesi başlatılıyor (3-5 dk sürebilir)...");
+    try {
+      const restored = await supervisorRequestLong("POST", `/backups/${encodeURIComponent(slug)}/restore/full`, {}, 10 * 60 * 1000);
+      if (!supervisorOk(restored)) {
+        throw new Error(supervisorErrorText(restored, "Geri yükleme başlatılamadı."));
+      }
+    } catch (restoreError) {
+      // Supervisor HA'yı yeniden başlatırken bağlantı düşebilir; bu beklenen durum.
+      const text = String(restoreError && restoreError.message || restoreError || "").toLowerCase();
+      if (!text.includes("socket") && !text.includes("econn") && !text.includes("closed") && !text.includes("aborted")) {
+        throw restoreError;
+      }
+      console.log("[NexusHA] Restore sonrası bağlantı koptu (beklenen):", restoreError.message);
+    }
+
+    reportBackupProgress(ws, "done", 100, "Geri yükleme başlatıldı; Home Assistant yeniden başlıyor...");
+    console.log("[NexusHA] HA restore tetiklendi:", slug, backupId || "");
+    return { ok: true, status: "restoring", slug, backupId };
+  } catch (error) {
+    const messageText = String(error && error.message || error || "Geri yükleme başarısız.").replace(/\s+/g, " ").trim().slice(0, 180);
+    reportBackupProgress(ws, "error", 0, messageText);
+    throw new Error(messageText);
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch (e) {}
+  }
 }
 
 async function uploadBackupToCloud(agentId, secret, slug, downloadStream) {
@@ -868,6 +1024,17 @@ function connect() {
             slug: result.slug || ""
           }))
           .catch((err) => backupReply(ws, r.reqId, false, err.message));
+        return;
+      }
+
+      if (r.type === "restore_ha_backup") {
+        restoreHaBackup(ws, r)
+          .then((result) => restoreReply(ws, r.reqId, true, "", {
+            status: result.status || "restoring",
+            slug: result.slug || "",
+            backupId: result.backupId || ""
+          }))
+          .catch((err) => restoreReply(ws, r.reqId, false, err.message));
         return;
       }
 
