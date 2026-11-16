@@ -18,7 +18,7 @@ function readAddonVersion() {
       if (match && match[1]) return String(match[1]).trim();
     } catch (e) {}
   }
-  return "1.4.5";
+  return "1.4.6";
 }
 
 const ADDON_VERSION = readAddonVersion();
@@ -665,7 +665,7 @@ async function uploadBackupChunked(ws, agentId, secret, slug, localTarPath, file
   const fileName = "NexusHA_Auto_Backup.tar";
   const basePath = `/api/homes/${encodeURIComponent(agentId)}`;
 
-  reportBackupProgress(ws, "upload", 50, `Yedek buluta parçalı aktarılıyor (0/${totalChunks})...`);
+  reportBackupProgress(ws, "upload", 40, `Buluta aktarılıyor (Parça 0/${totalChunks})...`);
 
   for (let index = 0; index < totalChunks; index++) {
     const start = index * chunkSize;
@@ -689,12 +689,12 @@ async function uploadBackupChunked(ws, agentId, secret, slug, localTarPath, file
     if (part.status >= 300) {
       throw new Error(String(part.body || `Parça yükleme reddedildi (${part.status}).`).replace(/\s+/g, " ").trim().slice(0, 180));
     }
-    const percent = Math.round(50 + (40 * ((index + 1) / totalChunks)));
+    const percent = 40 + Math.round(((index + 1) / totalChunks) * 50);
     reportBackupProgress(
       ws,
       "upload",
-      Math.min(90, Math.max(50, percent)),
-      `Yedek parçası gönderildi (${index + 1}/${totalChunks})...`
+      Math.min(90, Math.max(40, percent)),
+      `Buluta aktarılıyor (Parça ${index + 1}/${totalChunks})...`
     );
   }
 
@@ -727,7 +727,7 @@ async function createHaBackup(ws) {
   let slug = "";
   const tmpPath = path.join("/tmp", `nexusha-backup-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tar`);
   try {
-    reportBackupProgress(ws, "create", 15, "Home Assistant tam yedeği oluşturuluyor...");
+    reportBackupProgress(ws, "create", 15, "Home Assistant yedeği sıkıştırılıyor...");
     const created = await supervisorRequestLong("POST", "/backups/new/full", {
       name: "NexusHA_Auto_Backup"
     }, 45 * 60 * 1000);
@@ -739,14 +739,14 @@ async function createHaBackup(ws) {
     slug = String(data && data.slug || "").trim();
     if (!slug) throw new Error("Yedek slug değeri okunamadı.");
 
-    reportBackupProgress(ws, "download", 45, "Yedek dosyası hazırlanıyor...");
+    reportBackupProgress(ws, "download", 35, "Yedek dosyası hazırlanıyor...");
     const download = await supervisorDownloadStream(`/backups/${encodeURIComponent(slug)}/download`);
     const size = await streamToFile(download, tmpPath);
     if (!size) throw new Error("Boş yedek dosyası.");
 
     await uploadBackupChunked(ws, agentId, secret, slug, tmpPath, size);
 
-    reportBackupProgress(ws, "cleanup", 92, "Geçici yedek temizleniyor...");
+    reportBackupProgress(ws, "cleanup", 95, "Geçici yedek temizleniyor...");
     const removed = await supervisorDelete(`/backups/${encodeURIComponent(slug)}`);
     if (!supervisorOk(removed)) {
       console.log("[NexusHA] Geçici yedek silinemedi:", supervisorErrorText(removed, ""));
